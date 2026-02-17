@@ -28,13 +28,18 @@ docker compose up --build
 
 ```
 
+
 🌍 Access the Network
 
 Once running:
+
 API → http://localhost:9000
+
 Health check → http://localhost:9000/health
+
 
 Official Web Wallet:
 👉 https://wallet.argh.space
+
 Official Testnet Node:
 https://genesis-test.argh.space/chain/latest
