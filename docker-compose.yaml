@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  node:
+    build: .
+    command: python3 main.py
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./data:/data
+  api:
+    build: .
+    command: uvicorn api.server:app --host 0.0.0.0 --port 8080
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
