@@ -7,7 +7,6 @@ import time
 from core.peer import Peer
 from core.block import Block
 from config.settings import HOST_IP, HOST_PORT
-from core.state import compute_spendable_balances
 from core.tx_engine import TransactionEngine
 
 class P2PNetwork:
@@ -199,6 +198,28 @@ class P2PNetwork:
 
         elif msg["type"] == "tx":
             tx = msg["data"]
+
+            # --------------------------------------------------
+            # FLARE REVEAL (special protocol tx)
+            # --------------------------------------------------
+            if tx.get("action") == "flare_reveal":
+
+                required = ("txid", "commit", "payload", "sender", "chainId")
+                for k in required:
+                    if k not in tx:
+                        return
+
+                added = self.mempool.add(tx)
+                if not added:
+                    return
+
+                print(f"Accepted FLARE_REVEAL TX: {tx['txid']}")
+
+                await self.broadcast_except(peer_id, {
+                    "type": "tx",
+                    "data": tx
+                })
+                return
 
             required_common = ("txid", "action", "amount", "chainId", "asset")
             for k in required_common:

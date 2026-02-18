@@ -1,17 +1,5 @@
 # core/tx_engine.py
-ALLOWED_ASSETS = {"ARGH", "aUSD"}
 
-from config.settings import (
-    BRIDGE_ISSUER_ADDRESS,
-    EXPECTED_CHAIN_ID, 
-    TREASURY_ADDRESS,
-    TRANSFER_FEE_PERCENT,
-    FEE_TO_DEVS,
-    FEE_TO_ORBITAL,
-    FEE_TO_VALIDATOR,
-    DEVS_ADDRESS,
-    ORBITAL_ADDRESS
-)
 from core.storage import ChainStorage
 from eth_account import Account
 from eth_account.messages import encode_defunct
@@ -21,6 +9,8 @@ from core.utils import q
 from decimal import Decimal
 
 def k(addr, asset):
+    if addr and addr.startswith("0x"):
+        addr = addr.lower()
     return f"{addr}:{asset}"
 
 def is_canonical_amount(x) -> bool:
@@ -31,24 +21,35 @@ class TransactionEngine:
         self.storage = ChainStorage()
     
     @staticmethod
-    def calculate_fee(amount: float) -> dict:
-        total_fee = q(amount * TRANSFER_FEE_PERCENT)
+    def calculate_fee(amount, protocol) -> dict:
+        amount = Decimal(str(amount))
 
-        fee_devs = q(total_fee * FEE_TO_DEVS)
-        fee_orbital = q(total_fee * FEE_TO_ORBITAL)
-        fee_validator = q(total_fee - fee_devs - fee_orbital)
+        percent = Decimal(protocol["transfer_fee_percent"])
+        total_fee = amount * percent
+
+        dev_ratio = Decimal(protocol["fee_distribution"]["devs"])
+        orbital_ratio = Decimal(protocol["fee_distribution"]["orbital"])
+        validator_ratio = Decimal(protocol["fee_distribution"]["validator"])
+
+        fee_devs = total_fee * dev_ratio
+        fee_orbital = total_fee * orbital_ratio
+        fee_validator = total_fee - fee_devs - fee_orbital
 
         return {
-            "total": total_fee,
-            "devs": fee_devs,
-            "orbital": fee_orbital,
-            "validator": fee_validator
+            "total": q(total_fee),
+            "devs": q(fee_devs),
+            "orbital": q(fee_orbital),
+            "validator": q(fee_validator)
         }
+
     
-    def validate(self, tx: dict, balances: dict, *, system=False):
+    def validate(self, tx: dict, balances: dict, protocol, system=False):
         action = tx.get("action")
         amount = tx.get("amount", 0)
         sender = tx.get("sender")
+
+        native = protocol["native_asset"]
+        treasury = protocol["treasury"].lower()
 
         # 0. BASIC CHECK
         if not action:
@@ -63,7 +64,7 @@ class TransactionEngine:
         if not is_canonical_amount(amount):
             raise ValueError("Amount not canonical (max 8 decimals)")
 
-        if tx.get("chainId") != EXPECTED_CHAIN_ID:
+        if tx.get("chainId") != protocol["chain_id"]:
             raise ValueError("Invalid chainId")
     
         asset = tx.get("asset")
@@ -115,54 +116,59 @@ class TransactionEngine:
 
             asset = tx["asset"]
 
-            if asset not in ALLOWED_ASSETS:
+            if asset not in protocol["allowed_assets"]:
                 raise ValueError("Unsupported asset")
 
             if not system:
-                fee_breakdown = self.calculate_fee(amount)
+                fee_breakdown = self.calculate_fee(amount, protocol)
                 fee_total = fee_breakdown["total"]
             else:
                 fee_total = 0
 
-            if asset == "ARGH":
+            if asset == native:
                 required = amount + fee_total
-                if balances.get(f"{sender}:ARGH", 0) < required:
-                    raise ValueError("Insufficient ARGH balance including fee")
+                if balances.get(k(sender, native), 0) < required:
+                    raise ValueError(f"Insufficient {native} balance including fee")
             else:
-                if balances.get(f"{sender}:{asset}", 0) < amount:
+                if balances.get(k(sender, asset), 0) < amount:
                     raise ValueError("Insufficient asset balance")
 
                 if fee_total > 0:
-                    if balances.get(f"{sender}:ARGH", 0) < fee_total:
-                        raise ValueError("Insufficient ARGH balance for fee")
+                    if balances.get(k(sender, native), 0) < fee_total:
+                        raise ValueError(f"Insufficient {native} balance for fee")
 
         elif action == "mint_bridge":
-            if sender.lower() != BRIDGE_ISSUER_ADDRESS.lower():
+            if sender.lower() != protocol["bridge_issuer"].lower():
                 raise ValueError("Unauthorized bridge mint issuer")
             if not tx.get("to"):
                 raise ValueError("mint_bridge missing recipient")
-            if tx["asset"] not in ALLOWED_ASSETS:
+            if tx["asset"] not in  protocol["allowed_assets"]:
                 raise ValueError("Unsupported asset for bridge mint")
 
         elif action == "mint":
 
-            if system:
-                # ONLY allowed for ARGH protocol mint
-                if tx["asset"] != "ARGH":
-                    raise ValueError("Only ARGH can be system mint")
-                return
+            if not system:
+                raise ValueError("mint is protocol-only")
 
-            # bridge mint
-            if sender.lower() != BRIDGE_ISSUER_ADDRESS.lower():
-                raise ValueError("Unauthorized mint issuer")
+            if tx["asset"] != native:
+                raise ValueError(f"Only {native} can be system mint")
 
-            if not tx.get("to"):
-                raise ValueError("Mint missing recipient")
+            if tx.get("sender", "").lower() != treasury:
+                raise ValueError("Mint sender must be treasury")
+
+            if tx.get("to", "").lower() != treasury:
+                raise ValueError("Mint recipient must be treasury")
 
 
         elif action == "burn":
-            if not system and sender != TREASURY_ADDRESS:
-                raise ValueError("Unauthorized burn")
+            if not system:
+                raise ValueError("burn is protocol-only")
+
+            if tx.get("sender", "").lower() != treasury:
+                raise ValueError("Burn sender must be treasury")
+
+            if tx["asset"] != native:
+                raise ValueError(f"Only {native} can be burned")
 
         elif action == "add_liquidity":
             asset = tx.get("asset")
@@ -182,6 +188,8 @@ class TransactionEngine:
                 raise ValueError("reward must be system tx")
             if not tx.get("to"):
                 raise ValueError("reward missing recipient")
+            if tx.get("sender") != "_protocol":
+                raise ValueError("Invalid reward sender")
 
         else:
             raise ValueError("Unknown action")
@@ -198,16 +206,16 @@ class TransactionEngine:
         
         return nonce
 
-    def apply_tx(self, balances: dict, tx: dict, *, system=False, validator_address=None):
+    def apply_tx(self, balances: dict, tx: dict, *, system=False, validator_address=None, protocol):
         action = tx["action"]
         amount = tx["amount"]
-        sender = tx.get("sender")
+        sender = tx.get("sender").lower()
         to = tx.get("to")
         fee = tx.get("_fee", {})
 
         if action == "transfer":
             asset = tx["asset"]
-            fee_asset = "ARGH"
+            fee_asset = protocol["native_asset"]
 
             # amount
             balances[k(sender, asset)] = balances.get(k(sender, asset), 0) - amount

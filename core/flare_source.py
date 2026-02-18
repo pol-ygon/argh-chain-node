@@ -1,69 +1,94 @@
 import requests
-import statistics
+from typing import Optional
+from nacl.signing import VerifyKey
+from nacl.exceptions import BadSignatureError
+from core.utils import canonical_json
 
-URL_XRAY = "https://services.swpc.noaa.gov/json/goes/primary/xrays-1-day.json"
-# flare: A B C -> mint
-# flare: M X   -> burn
+# 👇 endpoint oracle
+ORACLE_URL = "https://flare-oracle.argh.space/flare/"
 
-URL_XRAY_BG = "https://services.swpc.noaa.gov/json/goes/primary/xray-background-7-day.json"
-# used to manage staking rewards low value + gain high value - gain
+# 👇 chiave pubblica oracle (hex)
+ORACLE_PUBKEY = "db8469661f0e6d01664b9759e7dbfb2f289e658e13c04e6418dbb9a27005d524"
 
-URL_MAGNETOMETERS = "https://services.swpc.noaa.gov/json/goes/primary/magnetometers-1-day.json"
-# used as a mint reducer can make mint + or - based on the values ​​of the magnetometers
 
 class FlareSource:
-    def get_latest(self):
-        print("🌐 Fetching Flares API...")
+    """
+    Blockchain-side flare source.
+    NON calcola nulla.
+    Verifica solo firma oracle.
+    """
+
+    def __init__(self):
+        self.verify_key = VerifyKey(bytes.fromhex(ORACLE_PUBKEY))
+
+    # --------------------------------------------------
+    # PUBLIC ENTRYPOINT
+    # --------------------------------------------------
+
+    def get_flare_for_slot(self, slot: int) -> Optional[dict]:
+        """
+        Recupera flare dallo slot specificato.
+        Verifica firma oracle.
+        Deterministico.
+        """
+
         try:
-            data_xray = requests.get(URL_XRAY, timeout=5).json()
-            data_bg = requests.get(URL_XRAY_BG, timeout=5).json()
-            data_mag = requests.get(URL_MAGNETOMETERS, timeout=5).json()
+            response = requests.get(f"{ORACLE_URL}{slot}", timeout=3)
 
-            # filters ONLY 0.05–0.4nm
-            filtered_xray = [
-                e for e in data_xray
-                if e.get("energy") == "0.05-0.4nm"
-            ]
-
-            if not filtered_xray:
+            if response.status_code != 200:
                 return None
 
-            latest_xray = filtered_xray[-1]
+            data = response.json()
 
-            # MAGNETOMETERS: Take last N minutes
-            totals = [
-                e["total"] for e in data_mag[-60:]
-                if "total" in e and e.get("arcjet_flag") is False
-            ]
+            # verifica slot coerente
+            if data.get("slot") != slot:
+                return None
 
-            geomag_sigma = (
-                statistics.stdev(totals)
-                if len(totals) >= 2
-                else 0.0
-            )
+            if not self._verify_oracle_signature(data):
+                print("❌ Invalid oracle signature")
+                return None
 
-            geomag_factor = self.geomag_factor_from_sigma(geomag_sigma)
-
+            # ritorna solo dati consensus-critical
             return {
-                "xray": latest_xray,
-                "geomag_sigma": geomag_sigma,
-                "geomag_factor": geomag_factor
+                "id": data["id"],
+                "slot": data["slot"],
+                "flux": int(data["flux"]),
+                "class": data["class"],
+                "geomag": int(data["geomag"]),
+                "oracle_signature": data["oracle_signature"],
             }
 
         except Exception as e:
             print("FlareSource error:", e)
             return None
 
-    
-    def geomag_factor_from_sigma(self, sigma):
-        if sigma < 0.2:
-            return 1.0      # noise → neutral
-        if sigma < 0.5:
-            return 1.3      # calm → boost mint
-        if sigma < 2:
-            return 1.0      # normal
-        if sigma < 5:
-            return 0.7      # disturbed
-        if sigma < 15:
-            return 0.3      # storm
-        return -0.5         # severe storm → burn
+    # --------------------------------------------------
+    # SIGNATURE VERIFICATION
+    # --------------------------------------------------
+
+    def _verify_oracle_signature(self, data: dict) -> bool:
+        """
+        Verifica firma ED25519 oracle.
+        """
+
+        try:
+            signature = bytes.fromhex(data["oracle_signature"])
+
+            payload = {
+                "id": data["id"],
+                "slot": data["slot"],
+                "class": data["class"],
+                "flux": data["flux"],
+                "geomag": data["geomag"],
+            }
+
+            message = canonical_json(payload)
+
+            self.verify_key.verify(message, signature)
+
+            return True
+
+        except BadSignatureError:
+            return False
+        except Exception:
+            return False

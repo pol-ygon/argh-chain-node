@@ -1,8 +1,10 @@
 # core/block_validator
-from config.settings import TREASURY_ADDRESS
+import hashlib
 from core.consensus import select_block_producer
+from core.flare_source import FlareSource
 from core.treasury import TreasuryEngine
 from core.tx_engine import TransactionEngine
+from core.utils import canonical_json, get_protocol
 from core.validator_keystore import verify_block_signature
 from core.state import compute_balances
 
@@ -14,7 +16,8 @@ class BlockValidator:
         self.chain = chain
         self.tx_engine = TransactionEngine()
 
-    def validate(self, block, prev_block, chain_until_prev):
+    def validate(self, block, prev_block, chain_until_prev, mode="live"):
+
         # --------------------------------------------------
         # 1. basic structure
         # --------------------------------------------------
@@ -34,6 +37,9 @@ class BlockValidator:
         # 🧱 GENESIS
         # --------------------------------------------------
         if block.index == 0:
+            if not block.protocol:
+                print("❌ Genesis missing protocol")
+                return False
             if block.prev_hash != "0" * 64:
                 print(f"❌ Invalid prev_hash")
                 return False
@@ -47,6 +53,11 @@ class BlockValidator:
                 print(f"❌ Invalid signature")
                 return False
             return True
+        
+        protocol = get_protocol(chain_until_prev)
+        if not protocol:
+            print("❌ Missing protocol state")
+            return False
 
         # --------------------------------------------------
         # 2. continuity
@@ -68,54 +79,119 @@ class BlockValidator:
             return False
 
         # --------------------------------------------------
-        # 3. flare sanity
-        # --------------------------------------------------
-        if block.flare_time is None:
-            print(f"❌ Invalid flare_time (1)")
-            return False
-
-        if block.flare_time > block.block_time:
-            print(f"❌ Invalid flare_time (2)")
-            return False
-
-        # --------------------------------------------------
         # 4. hash
         # --------------------------------------------------
         if block.compute_hash() != block.hash:
             print(f"❌ Invalid Hash")
             return False
+        
+        # --------------------------------------------------
+        # FLARE REVEAL VERIFICATION (API deterministic)
+        # --------------------------------------------------
+
+        if mode == "live":
+            flare_reveal_txs = [
+                tx for tx in block.transactions
+                if tx.get("action") == "flare_reveal"
+            ]
+
+            if flare_reveal_txs:
+
+                if len(flare_reveal_txs) != 1:
+                    print("❌ Multiple flare_reveal TX")
+                    return False
+
+                reveal_tx = flare_reveal_txs[0]
+                payload = reveal_tx["payload"]
+
+                raw = canonical_json(payload)
+                actual_commit = hashlib.sha256(raw).hexdigest()
+
+                if actual_commit != prev_block.flare_commit:
+                    print("❌ Commit mismatch")
+                    return False
+
+                flare_source = FlareSource()
+                expected_flare = flare_source.get_flare_for_slot(
+                    prev_block.slot - 1
+                )
+
+                if not expected_flare:
+                    print("❌ Cannot fetch flare for verification")
+                    return False
+
+                print(expected_flare["flux"])
+                print(payload["flux"])
+                
+                print(expected_flare["geomag"])
+                print(payload["geomag"])
+
+                flux_scaled = expected_flare["flux"]
+                geomag_scaled = expected_flare["geomag"]
+
+                # 🔒 3️⃣ Compare values
+                if payload["flux"] != flux_scaled:
+                    print("❌ Flux mismatch")
+                    return False
+
+                if payload["class"] != expected_flare["class"]:
+                    print("❌ Class mismatch")
+                    return False
+
+                if payload["geomag"] != geomag_scaled:
+                    print("❌ Geomag mismatch")
+                    return False
 
         # --------------------------------------------------
-        # 5. treasury validation
+        # 5. treasury validation (commit/reveal model)
         # --------------------------------------------------
 
-        # Rebuild balances up to prev_block
-        balances = compute_balances(chain_until_prev)
-        treasury_balance = balances.get(TREASURY_ADDRESS, 0)
+        balances = compute_balances(chain_until_prev, protocol)
+        treasury_address = protocol["treasury"]
+        treasury_balance = balances.get(f"{treasury_address}:ARGH", 0)
 
-        # Recalculate expected delta
-        # GENESIS has no flare → skips treasury validation
-        if block.index == 0:
-            return True
+        expected_action = None
+        expected_delta = 0
 
-        if block.flare_id is None:
-            print(f"❌ Invalid Block: missing flare_id")
-            return False
+        # Cerca flare_reveal TX nel blocco corrente
+        reveal_txs = [
+            tx for tx in block.transactions
+            if tx.get("action") == "flare_reveal"
+        ]
 
-        prev_block_flare_id = prev_block.flare_id if prev_block else None
+        if reveal_txs:
+            if len(reveal_txs) != 1:
+                print("❌ Multiple flare_reveal TX")
+                return False
 
-        if block.flare_id == prev_block_flare_id:
-            # Same flare as previous block → no system TX expected
-            expected_action = None
-            expected_delta = 0
-        else:
+            reveal_tx = reveal_txs[0]
+
+            # sender deve essere producer del blocco precedente
+            if reveal_tx["sender"] != prev_block.producer_id:
+                print("❌ Reveal sender mismatch")
+                return False
+
+            payload = reveal_tx["payload"]
+
+            # verifica commit
+            raw = canonical_json(payload)
+
+            actual_commit = hashlib.sha256(raw).hexdigest()
+
+            if actual_commit != prev_block.flare_commit:
+                print("❌ Reveal commit mismatch")
+                return False
+
+            # Calcola delta
             expected_delta, expected_action = TreasuryEngine.compute_delta(
-                block.flare_flux,
-                block.flare_class,
-                block.geomag_factor,
-                treasury_balance
+                payload["flux"],
+                payload["class"],
+                payload["geomag"],
+                treasury_balance,
+                protocol
             )
-        # Extract mint/burn from the block
+
+        # Controlla mint/burn
         system_txs = [
             tx for tx in block.transactions
             if tx.get("action") in ("mint", "burn")
@@ -123,40 +199,30 @@ class BlockValidator:
 
         if expected_action is None:
             if system_txs:
-                print(f"❌ Invalid TX (1)")
+                print("❌ Unexpected system TX")
                 return False
         else:
             if len(system_txs) != 1:
-                print(f"❌ Invalid TX (2)")
+                print("❌ Missing system TX")
                 return False
 
             tx = system_txs[0]
 
             if tx["action"] != expected_action:
-                print(f"❌ Invalid TX: unexpected action")
+                print("❌ Wrong action")
                 return False
 
             if tx["amount"] != expected_delta:
-                print(f"❌ Invalid TX: unexpected amount")
-                return False
-            
-
-        for tx in block.transactions:
-            is_system = tx.get("action") in ("mint", "burn", "reward")
-            try:
-                self.tx_engine.validate(tx, balances, system=is_system)
-                self.tx_engine.apply_tx(balances, tx, system=is_system)
-            except ValueError as e:
-                print(f"❌ Invalid TX during block validation: {e}")
+                print("❌ Wrong amount")
                 return False
 
         # --------------------------------------------------
         # 6. Leader
         # --------------------------------------------------
         expected_leader = select_block_producer(
-            last_block_flare_data=prev_block.get_flare_seed(),
             validators=self.validators,
             last_block_hash=prev_block.hash,
+            slot=block.slot
         )
 
         if block.producer_id != expected_leader:

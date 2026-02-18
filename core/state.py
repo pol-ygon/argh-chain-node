@@ -1,10 +1,9 @@
 # core/state.py
 
-from config.settings import TREASURY_ADDRESS
 from core.tx_engine import TransactionEngine
 from core.utils import is_system_tx
 
-def compute_balances(chain):
+def compute_balances(chain, protocol):
     """Calcola i balance finali dalla chain"""
     balances = {}
     tx_engine = TransactionEngine()
@@ -13,19 +12,26 @@ def compute_balances(chain):
         block = block_data if isinstance(block_data, dict) else block_data.to_dict()
         validator = block.get("producer_id")
         
-        for tx in block.get("transactions", []):            
+        for tx in block.get("transactions", []):
+
+            # 🔥 IGNORA transazioni non economiche
+            if tx.get("action") == "flare_reveal":
+                continue
+
             tx_engine.apply_tx(
                 balances,
                 tx,
                 system=is_system_tx(tx),
-                validator_address=validator
+                validator_address=validator,
+                protocol=protocol
             )
     
     return balances
 
-def compute_spendable_balances(chain, pending_txs):
+
+def compute_spendable_balances(chain, pending_txs, protocol):
     """Calcola balance spendibili (chain + mempool)"""
-    balances = compute_balances(chain)
+    balances = compute_balances(chain, protocol)
     tx_engine = TransactionEngine()
     
     
@@ -34,7 +40,8 @@ def compute_spendable_balances(chain, pending_txs):
             balances,
             tx,
             system=is_system_tx(tx),
-            validator_address=None
+            validator_address=None,
+            protocol=protocol
         )
     
     return balances

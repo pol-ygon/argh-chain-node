@@ -94,3 +94,22 @@ def is_equivocation(self, block):
         ):
             return True
     return False
+
+def canonical_json(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+
+def get_protocol(chain):
+    if not chain:
+        return None
+
+    first = chain[0]
+
+    # Caso Block object
+    if hasattr(first, "protocol"):
+        return first.protocol
+
+    # Caso dict (API)
+    if isinstance(first, dict):
+        return first.get("protocol")
+
+    return None

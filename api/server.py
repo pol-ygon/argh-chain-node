@@ -6,8 +6,8 @@ from core.block import Block
 from core.mempool import Mempool
 from core.state import compute_pools
 from core.storage import ChainStorage
-from core.tx_engine import TransactionEngine
-from core.utils import canonical_tx
+from core.tx_engine import TransactionEngine, is_canonical_amount
+from core.utils import canonical_tx, get_protocol
 
 import uuid
 import time
@@ -117,11 +117,14 @@ def get_nonce(address: str):
 @app.post("/tx/send")
 async def send_tx(payload: dict):
     mempool = Mempool()
+    storage = ChainStorage()
+
+    chain = storage.load()
+    protocol = get_protocol(chain)
 
     tx = payload["tx"]
     signature = payload["signature"]
 
-    # signed payload (MUST match canonical_tx)
     signed_payload = {
         key: tx[key]
         for key in ("txid", "action", "asset", "amount", "to", "nonce", "chainId")
@@ -129,18 +132,19 @@ async def send_tx(payload: dict):
     }
 
     message = canonical_tx(signed_payload)
-    print("BACKEND MESSAGE:", message)
 
-    recovered = Account.recover_message(
-        encode_defunct(text=message),
-        signature=signature
-    )
+    try:
+        recovered = Account.recover_message(
+            encode_defunct(text=message),
+            signature=signature
+        )
+    except Exception:
+        return {"ok": False, "error": "Invalid signature format"}
 
     sender = recovered.lower()
-    print("BACKEND RECOVERED:", sender)
 
-    # complete the tx
-    tx["sender"] = sender
+    # complete tx
+    tx["sender"] = sender.lower()
     tx["timestamp"] = int(time.time())
 
     tx["_meta"] = {
@@ -152,18 +156,28 @@ async def send_tx(payload: dict):
     if "to" in tx:
         tx["to"] = tx["to"].lower()
 
-    # basic validations
-    if tx.get("action") == "transfer" and not tx.get("to"):
-        return {"ok": False, "error": "Missing recipient"}
+    # --- PROTOCOL CHECKS ---
+    if tx.get("chainId") != protocol["chain_id"]:
+        return {"ok": False, "error": "Invalid chainId"}
+
+    if tx.get("asset") not in protocol["allowed_assets"]:
+        return {"ok": False, "error": "Unsupported asset"}
 
     if tx.get("amount", 0) <= 0:
         return {"ok": False, "error": "Invalid amount"}
 
-    if not tx.get("asset"):
-        return {"ok": False, "error": "Missing asset"}
+    # NONCE CHECK
+    tx_engine = TransactionEngine()
+    expected_nonce = tx_engine._calculate_nonce(sender)
 
-    print("TX RECEIVED:", tx)
+    if tx.get("nonce") != expected_nonce:
+        return {"ok": False, "error": f"Invalid nonce. Expected {expected_nonce}"}
 
+    # BASIC ACTION CHECK
+    if tx.get("action") not in ("transfer", "add_liquidity"):
+        return {"ok": False, "error": "Unsupported action"}
+
+    # ADD TO MEMPOOL
     added = mempool.add(tx)
     if not added:
         return {"ok": False, "error": "TX already in mempool"}
@@ -171,19 +185,22 @@ async def send_tx(payload: dict):
     return {
         "ok": True,
         "sender": sender,
-        "txid": tx["txid"],
-        "gossiped": added
+        "txid": tx["txid"]
     }
 
 @app.post("/tx/mint")
 async def send_mint_tx(payload: dict):
     mempool = Mempool()
+    storage = ChainStorage()
+
+    chain = storage.load()
+    protocol = get_protocol(chain)
 
     tx = payload["tx"]
     tx["action"] = "mint_bridge"
     signature = payload["signature"]
 
-    # Build canonical payload for signature verification
+    # Build canonical payload
     signed_payload = {
         key: tx[key]
         for key in ("txid", "action", "asset", "amount", "to", "nonce", "chainId")
@@ -191,7 +208,6 @@ async def send_mint_tx(payload: dict):
     }
 
     message = canonical_tx(signed_payload)
-    print("MINT MESSAGE:", message)
 
     try:
         recovered = Account.recover_message(
@@ -199,19 +215,43 @@ async def send_mint_tx(payload: dict):
             signature=signature
         )
     except Exception:
-        print("Invalid signature format")
         return {"ok": False, "error": "Invalid signature format"}
 
     sender = recovered.lower()
-    print("RECOVERED:", sender)
 
-    # Only issuer can mint
-    if sender != BRIDGE_ISSUER_ADDRESS.lower():
-        print("Unauthorized mint issuer")
+    # 🔐 Only protocol-defined bridge issuer
+    if sender != protocol["bridge_issuer"].lower():
         return {"ok": False, "error": "Unauthorized mint issuer"}
 
-    # Complete the tx
-    tx["sender"] = sender
+    # 🔐 chainId check
+    if tx.get("chainId") != protocol["chain_id"]:
+        return {"ok": False, "error": "Invalid chainId"}
+
+    # 🔐 asset check
+    native = protocol["native_asset"]
+
+    if tx.get("asset") == native:
+        return {"ok": False, "error": "Bridge cannot mint native asset"}
+
+    if tx.get("asset") not in protocol["allowed_assets"]:
+        return {"ok": False, "error": "Unsupported asset"}
+
+    # 🔐 amount check
+    if tx.get("amount", 0) <= 0:
+        return {"ok": False, "error": "Invalid amount"}
+
+    if not is_canonical_amount(tx["amount"]):
+        return {"ok": False, "error": "Non canonical amount"}
+
+    # 🔐 nonce check
+    tx_engine = TransactionEngine()
+    expected_nonce = tx_engine._calculate_nonce(sender)
+
+    if tx.get("nonce") != expected_nonce:
+        return {"ok": False, "error": f"Invalid nonce. Expected {expected_nonce}"}
+
+    # Complete tx
+    tx["sender"] = sender.lower()
     tx["timestamp"] = int(time.time())
 
     tx["_meta"] = {
@@ -224,34 +264,17 @@ async def send_mint_tx(payload: dict):
     if "to" in tx:
         tx["to"] = tx["to"].lower()
 
-    # Mint specific validations
-    if tx.get("action") != "mint_bridge":
-        print("Invalid action")
-        return {"ok": False, "error": "Invalid action"}
-
-    if tx.get("asset") != "aUSD":
-        print("Invalid asset")
-        return {"ok": False, "error": "Invalid asset"}
-
-    if tx.get("amount", 0) <= 0:
-        print("Invalid amount")
-        return {"ok": False, "error": "Invalid amount"}
-
-    print("MINT TX RECEIVED:", tx)
-
+    # Add to mempool
     added = mempool.add(tx)
-    
+
     if not added:
-        print("TX already in mempool")
         return {"ok": False, "error": "TX already in mempool"}
 
     return {
         "ok": True,
         "issuer": sender,
-        "txid": tx["txid"],
-        "gossiped": added
+        "txid": tx["txid"]
     }
-
 
 @app.get("/pools")
 def get_pools():
@@ -405,6 +428,11 @@ def tx_history(address: str):
 def tx_pending(address: str):
     address = norm(address)
     mempool = Mempool()
+    storage = ChainStorage()
+
+    chain = storage.load()
+    protocol = get_protocol(chain)
+    native = protocol["native_asset"]
 
     txs = []
 
@@ -412,11 +440,12 @@ def tx_pending(address: str):
         if not tx_involves_address(tx, address):
             continue
 
-        asset = tx.get("asset")
-
         fee = tx.get("_fee", {}).get("total")
+
         if fee is None and tx.get("action") == "transfer":
-            fee = TransactionEngine.calculate_fee(tx["amount"])["total"]
+            fee = TransactionEngine.calculate_fee(
+                tx["amount"], protocol
+            )["total"]
         else:
             fee = fee or 0
 
@@ -426,10 +455,10 @@ def tx_pending(address: str):
         entry = {
             "txid": tx.get("txid"),
             "action": tx.get("action"),
-            "asset": asset,
+            "asset": tx.get("asset"),
             "amount": tx.get("amount"),
             "fee": fee,
-            "fee_asset": "ARGH",
+            "fee_asset": native,
             "from": sender,
             "to": to,
             "timestamp": tx.get("timestamp", 0),
@@ -438,8 +467,8 @@ def tx_pending(address: str):
 
         if sender == address:
             entry["total_spent"] = {
-                asset: tx.get("amount", 0),
-                "ARGH": fee
+                tx.get("asset"): tx.get("amount", 0),
+                native: fee
             }
 
         txs.append(entry)
@@ -509,61 +538,25 @@ def get_balance(address: str):
     address = norm(address)
     chain = storage.load()
 
-    balances = {}
+    protocol = get_protocol(chain)
+    if not protocol:
+        raise ValueError("Missing protocol state")
 
-    def add(asset, value):
-        balances[asset] = balances.get(asset, 0) + value
+    from core.state import compute_balances
 
-    for block in chain:
-        producer = norm(block.get("producer_id"))
+    balances = compute_balances(chain, protocol)
+    user_balances = {}
 
-        for tx in block.get("transactions", []):
-            action = tx.get("action")
-            asset = tx.get("asset")
-            amount = tx.get("amount", 0)
+    for key, value in balances.items():
+        if ":" not in key:
+            continue
 
-            raw_sender = tx.get("sender")
-            raw_to = tx.get("to")
+        addr, asset = key.rsplit(":", 1)
 
-            sender = norm(raw_sender) if raw_sender and raw_sender.startswith("0x") else raw_sender
-            to = norm(raw_to) if raw_to and raw_to.startswith("0x") else raw_to
-
-            fee = tx.get("_fee", {})
-
-            if action == "transfer":
-                if sender == address:
-                    add(asset, -amount)
-                if to == address:
-                    add(asset, amount)
-
-                if fee:
-                    if sender == address:
-                        add("ARGH", -fee.get("total", 0))
-                    if address == DEVS_ADDRESS:
-                        add("ARGH", fee.get("devs", 0))
-                    if address == ORBITAL_ADDRESS:
-                        add("ARGH", fee.get("orbital", 0))
-                    if address == producer:
-                        add("ARGH", fee.get("validator", 0))
-
-            elif action in ("mint", "mint_bridge"):
-                if to == address:
-                    add(asset, amount)
-
-            elif action == "burn":
-                if sender == address:
-                    add(asset, -amount)
-
-            elif action == "add_liquidity":
-                if sender == address:
-                    add(asset, -tx["amount"])
-                    add(tx["asset_paired"], -tx["amount_paired"])
-
-            elif action == "reward":
-                if to == address:
-                    add(asset, amount)
+        if addr.lower() == address:
+            user_balances[asset] = value
 
     return {
         "address": address,
-        "balances": balances
+        "balances": user_balances
     }
