@@ -25,7 +25,6 @@ import asyncio
 
 from core.utils import canonical_json, get_protocol, norm, q, loading, load_validators
 from core.validator_keystore import load_or_create_validator_key, pubkey_to_address, write_env_address
-from core.validator_keystore import load_or_create_validator_key
 
 # -----------------------------
 # TIME SLOT CONFIGURATION
@@ -119,9 +118,10 @@ async def handle_reveal(
     actual_commit = hashlib.sha256(raw).hexdigest()
 
     if actual_commit != parent_block.flare_commit:
-        raise ValueError("Reveal commit mismatch")
+        print("Reveal commit mismatch, skipping reveal")
+        return system_txs, None
 
-    print("✅ Valid flare reveal TX detected")
+    print("Valid flare reveal TX detected")
 
     flux = payload["flux"]
     flare_cls = payload["class"]
@@ -150,7 +150,7 @@ async def handle_reveal(
         protocol
     )
 
-    print(f"💰 Reveal Δ: {delta:+,} ({action})")
+    print(f"Reveal delta: {delta:+,} ({action})")
 
     if action and q(delta) > 0:
         system_tx = Transaction(
@@ -163,6 +163,10 @@ async def handle_reveal(
             chainId=protocol["chain_id"],
             asset=native_asset
         ).to_dict()
+
+        system_tx["txid"] = hashlib.sha256(
+            f"{action}:{q(delta)}:{parent_block.slot}".encode()
+        ).hexdigest()
 
         system_tx["_fee"] = {
             "total": 0,
@@ -177,27 +181,30 @@ async def handle_reveal(
     return system_txs, reveal_tx
 
 async def handle_commit(flare_source, current_slot):
-    previous_slot = current_slot - 1
+    #previous_slot = current_slot
 
-    # 🔒 flare deterministico per slot
-    flare_data = flare_source.get_flare_for_slot(previous_slot)
+    # Deterministic flare for slot (HTTP call offloaded to a separate thread)
+    flare_data = await asyncio.to_thread(flare_source.get_flare_for_slot, current_slot)
 
     if not flare_data:
         return None, None
 
-    # 🔒 secret NON deve influenzare consenso
+    # The secret must NOT influence consensus
     secret = secrets.token_hex(16)
 
+    # Include everything signed by the oracle
     reveal_payload = {
         "id": flare_data["id"],
-        "flux": flare_data["flux"],
+        "slot": flare_data["slot"],
+        #"slot": current_slot,
         "class": flare_data["class"],
+        "flux": flare_data["flux"],
         "geomag": flare_data["geomag"],
+        "oracle_signature": flare_data["oracle_signature"],
         "secret": secret
     }
 
     raw = canonical_json(reveal_payload)
-
     flare_commit = hashlib.sha256(raw).hexdigest()
 
     return flare_commit, reveal_payload
@@ -210,19 +217,19 @@ async def handle_commit(flare_source, current_slot):
 async def main():
     SIGNING_KEY, NODE_ADDRESS = bootstrap_validator()
 
-    #🔹Print Logo
+    # Print logo
     loading(NODE_ADDRESS)
 
-    #🔹Load Validators
+    # Load validators
     VALIDATORS, VALIDATOR_PUBKEYS, nodes = load_validators()
 
     storage = ChainStorage()
     raw_chain = storage.load()
     chain = [Block.from_dict(b) for b in raw_chain] if raw_chain else []
 
+
     mempool = Mempool()
     tx_engine = TransactionEngine()
-    flare_source = FlareSource()
 
     validator = BlockValidator(
       validators=VALIDATORS,
@@ -230,7 +237,7 @@ async def main():
       chain=chain
     )
 
-    #🔹Init. Peers
+    # Initialize peers
     MY_NODE_ID = NODE_ADDRESS
     p2p = P2PNetwork(
       MY_NODE_ID,
@@ -251,14 +258,14 @@ async def main():
     asyncio.create_task(server.serve_forever())
     await asyncio.sleep(3)
 
-    #🔹Generate or Skip
+    # Generate genesis or skip
     genesis.generate(chain, p2p, storage)
 
-    #🔹Verifing Integrity
+    # Verify chain integrity
     if not validate_chain(chain, validator):
-      print("❌ Blockchain is compromised, please clean ./data/chain.enc")
+      print("Blockchain is compromised, please clean ./data/chain.enc")
       sys.exit(1)
-    print("✅ Blockchain is Valid")
+    print("Blockchain is valid")
 
     protocol = get_protocol(chain)
     if not protocol:
@@ -269,6 +276,8 @@ async def main():
     asyncio.create_task(mempool_gossip_loop(p2p, mempool))
     asyncio.create_task(p2p.heartbeat())
 
+    flare_source = FlareSource(protocol)
+
     # -----------------------------
     # Loop
     # -----------------------------
@@ -276,7 +285,7 @@ async def main():
         await asyncio.sleep(0)
 
         if not chain:
-            print("⏳ Chain is empty, waiting for the genesis...")
+            print("Chain is empty, waiting for genesis...")
             await asyncio.sleep(1)
             continue
 
@@ -290,70 +299,108 @@ async def main():
           continue
 
 
-                
-        # ✅ Skipping if this slot is already processed
+
+        # Skip if this slot was already processed
         if current_slot == last_processed_slot:
             await asyncio.sleep(1)
             continue
-        
-        # ✅ Calculate the wainting time until next slot
+
+        # Calculate the waiting time until the next slot
         current_time = time.time()
         slot_start = get_slot_start_time(current_slot, protocol)
-        
-        # If you are not in the slot, just wait
+
+        # If not in the slot yet, wait
         if current_time < slot_start:
             wait_time = slot_start - current_time
             slot_timestamp = datetime.fromtimestamp(slot_start).strftime('%H:%M:%S')
-            print(f"⏰ Waiting --> #{current_slot} ({slot_timestamp}) - {wait_time:.1f}s")
+            print(f"Waiting --> #{current_slot} ({slot_timestamp}) - {wait_time:.1f}s")
             await asyncio.sleep(wait_time)
             current_time = time.time()
-        
-        # ✅ Verify that you are in the right time window
+
+        # Verify that we are in the right time window
         if not is_valid_block_time(current_slot, protocol):
             # If it's too late for this slot, wait for the next one
             await asyncio.sleep(0.5)
             continue
-        
-        # ✅ Print the slot header
+
+        # Wait for sync to complete
+        if p2p.syncing:
+            print("Sync in progress, skipping slot...")
+            await asyncio.sleep(1)
+            continue
+
+        # Print the slot header
         print(f"\n{'='*70}")
-        print(f"🕐 SLOT #{current_slot} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"SLOT #{current_slot} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*70}")
 
 
         if not chain:
-            print("⏳ Chain still empty after reload, waiting for sync...")
+            print("Chain still empty after reload, waiting for sync...")
             await asyncio.sleep(1)
             continue
 
-        # ✅ EXTRACT SOLAR DATA FROM THE LAST BLOCK (DETERMINISTIC)
+        # Extract solar data from the last block (deterministic)
 
         parent_block = chain[-1]
-        parent_chain = chain[:]   # snapshot BEFORE the new block
+        parent_chain = chain[:]   # snapshot before the new block
 
-        last_block = chain[-1]
-        last_block_dict = last_block.to_dict()
+        # Select leader
+        current_attempt = 0
 
-        # 🎯 Select leader
         leader = select_block_producer(
             validators=VALIDATORS,
             last_block_hash=parent_block.hash,
-            slot=current_slot
+            slot=current_slot,
+            attempt=current_attempt
         )
-        
-        print(f"👑 The leader for this slot is: {leader}")
-        print(f"   (calculated by block #{last_block_dict.get('index')} hash {last_block_dict.get('hash', '')[:16]}...)")
 
-        # ✅ I'm not the leader
+        print(f"The leader for this slot is: {leader}")
+
+        # Not the leader for this slot
         if leader.lower() != MY_NODE_ID.lower():
-          print(f"⏭️ I'm not the leader, waiting the block from: {leader}")
-          print(f"⏳ Waiting {BLOCK_PROPAGATION_WAIT}s for the propagation...")
-          await asyncio.sleep(BLOCK_PROPAGATION_WAIT)
-          continue
-        
-        print(f"▶️ I'm the leader for this slot!")
+            current_time = time.time()
+            slot_start = get_slot_start_time(current_slot, protocol)
+            slot_end = slot_start + SLOT_TOLERANCE
+
+            wait_time = max(0, slot_end - current_time)
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+
+            if chain[-1].slot == current_slot:
+                last_processed_slot = current_slot
+                continue
+
+            fallback_leader = select_block_producer(
+                validators=VALIDATORS,
+                last_block_hash=parent_block.hash,
+                slot=current_slot,
+                attempt=1
+            )
+
+            print(f"Primary leader absent, fallback: {fallback_leader}")
+
+            if fallback_leader.lower() == MY_NODE_ID.lower():
+                print("I am the fallback leader!")
+                current_attempt = 1
+            else:
+                slot_end_fallback = slot_start + SLOT_TOLERANCE * 2
+                wait_time = max(0, slot_end_fallback - time.time())
+                await asyncio.sleep(wait_time)
+
+                # Check if the block arrived during the wait
+                if chain[-1].slot == current_slot:
+                    last_processed_slot = current_slot
+                    continue
+
+                last_processed_slot = current_slot
+                continue
+
+
+        print("I am the leader for this slot!")
 
         # =====================================================
-        # 1️⃣ REVEAL PHASE (valida blocco precedente)
+        # 1. REVEAL PHASE (validates the previous block)
         # =====================================================
 
         user_txs = mempool.load()
@@ -368,7 +415,7 @@ async def main():
         )
 
         # =====================================================
-        # 3️⃣ USER TX PROCESSING
+        # 3. USER TX PROCESSING
         # =====================================================
 
         user_txs = mempool.load()
@@ -383,7 +430,7 @@ async def main():
                 await asyncio.sleep(0)
 
             if tx.get("action") == "flare_reveal":
-                continue   # viene validata nella fase reveal
+                continue  # validated in the reveal phase
 
             try:
                 tx_engine.validate(tx, spendable_balances, protocol)
@@ -411,16 +458,16 @@ async def main():
                 )
 
             except ValueError as e:
-                print(f"❌ DISCARDED: {e}")
+                print(f"DISCARDED: {e}")
                 invalid_txids.add(tx["txid"])
 
         if reveal_tx:
             valid_user_txs.append(reveal_tx)
 
-        print(f"📝 Processed TX: {len(valid_user_txs)} user + {len(system_txs)} system")
+        print(f"Processed TX: {len(valid_user_txs)} user + {len(system_txs)} system")
 
         # =====================================================
-        # 4️⃣ FEES
+        # 4. FEES
         # =====================================================
 
         fee_totals = {
@@ -447,14 +494,14 @@ async def main():
             reward_tx = make_reward(protocol["orbital"], fee_totals["orbital"], protocol)
             tx_engine.validate(reward_tx, spendable_balances, protocol, system=True)
             system_txs.append(reward_tx)
-        
+
         if fee_totals["validator"] > 0:
             reward_tx = make_reward(NODE_ADDRESS, fee_totals["validator"], protocol)
             tx_engine.validate(reward_tx, spendable_balances, protocol, system=True)
             system_txs.append(reward_tx)
 
         # =====================================================
-        # 5️⃣ BLOCK CREATION
+        # 5. BLOCK CREATION
         # =====================================================
 
         txs = valid_user_txs + system_txs
@@ -474,6 +521,7 @@ async def main():
             slot=current_slot,
             flare_commit=flare_commit,
             producer_id=NODE_ADDRESS,
+            attempt=current_attempt,
         )
 
         block.signature = SIGNING_KEY.sign(
@@ -484,18 +532,18 @@ async def main():
         await asyncio.to_thread(storage.save, chain)
 
         # =====================================================
-        # 6️⃣ CLEAN MEMPOOL
+        # 6. CLEAN MEMPOOL
         # =====================================================
 
         included_txids = {tx["txid"] for tx in valid_user_txs}
         mempool.remove_many(included_txids | invalid_txids)
 
-        print(f"⛓️ Block #{block.index} created")
+        print(f"Block #{block.index} created")
         print(f"   Hash: {block.hash[:16]}...")
         print("="*70)
 
         # =====================================================
-        # 7️⃣ BROADCAST
+        # 7. BROADCAST
         # =====================================================
 
         await p2p.broadcast({
@@ -503,9 +551,9 @@ async def main():
             "data": block.to_dict()
         })
 
-        print("📡 Block sent to P2P network")
+        print("Block sent to P2P network")
 
-        # DOPO broadcast del blocco
+        # After broadcasting the block
         if new_reveal and flare_commit:
 
             reveal_tx = {
@@ -530,7 +578,7 @@ async def main():
                 "data": reveal_tx
             })
 
-            print("📤 Flare reveal TX broadcasted")
+            print("Flare reveal TX broadcasted")
 
 
         last_processed_slot = current_slot
@@ -561,7 +609,7 @@ async def mempool_gossip_loop(p2p, mempool):
             await asyncio.sleep(2)
 
         except Exception as e:
-            print("💥 GOSSIP LOOP CRASHED:", e)
+            print("GOSSIP LOOP CRASHED:", e)
             await asyncio.sleep(1)
 
 

@@ -1,6 +1,5 @@
 # core/tx_engine.py
 
-from core.storage import ChainStorage
 from eth_account import Account
 from eth_account.messages import encode_defunct
 from core.utils import canonical_tx
@@ -17,9 +16,6 @@ def is_canonical_amount(x) -> bool:
     return Decimal(str(x)).as_tuple().exponent >= -8
 
 class TransactionEngine:
-    def __init__(self):
-        self.storage = ChainStorage()
-    
     @staticmethod
     def calculate_fee(amount, protocol) -> dict:
         amount = Decimal(str(amount))
@@ -100,7 +96,7 @@ class TransactionEngine:
             if nonce is None:
                 raise ValueError("Missing nonce")
 
-            expected_nonce = self._calculate_nonce(sender)
+            expected_nonce = balances.get(f"_nonce_{sender.lower()}", 0)
             
             if nonce != expected_nonce:
                 raise ValueError(
@@ -193,18 +189,6 @@ class TransactionEngine:
 
         else:
             raise ValueError("Unknown action")
-
-    def _calculate_nonce(self, address: str) -> int:
-        address = address.lower()
-        chain = self.storage.load()
-        
-        nonce = 0
-        for block in chain:
-            for tx in block.get("transactions", []):
-                if tx.get("sender", "").lower() == address:
-                    nonce += 1
-        
-        return nonce
 
     def apply_tx(self, balances: dict, tx: dict, *, system=False, validator_address=None, protocol):
         action = tx["action"]

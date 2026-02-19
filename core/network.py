@@ -9,6 +9,9 @@ from core.block import Block
 from config.settings import HOST_IP, HOST_PORT
 from core.tx_engine import TransactionEngine
 
+MAX_MSG_SIZE = 10 * 1024 * 1024  # 10 MB
+BLOCKS_PER_PAGE = 200
+
 class P2PNetwork:
     def __init__(self, my_node_id, chain, storage, validator, mempool, my_host=HOST_IP, my_port=HOST_PORT):
         self.my_node_id = my_node_id
@@ -19,7 +22,7 @@ class P2PNetwork:
         self.my_port = int(my_port)
         self.peers = {}
         self.syncing = False
-        self.sync_target = None 
+        self.sync_target = None
         self.buffered_blocks = []
         self.mempool = mempool
         self.tx_engine = TransactionEngine()
@@ -75,7 +78,7 @@ class P2PNetwork:
                     break
 
                 except Exception as e:
-                    print(f"❌ Connection failed: {host}:{port}", e)
+                    print(f"Connection failed: {host}:{port}", e)
                     await asyncio.sleep(5)
 
     async def safe_drain(self, writer, timeout=3):
@@ -109,7 +112,7 @@ class P2PNetwork:
             await self.send(writer, {
                 "type": "status",
                 "latest_index": len(self.chain) - 1,
-                "latest_hash": self.chain[-1].hash
+                "latest_hash": self.chain[-1].hash if self.chain else None
             })
 
             self.peers[peer_node_id] = Peer(peer_node_id, writer)
@@ -123,7 +126,7 @@ class P2PNetwork:
             pass  # Invalid or incomplete handshake, close silently
         except Exception as e:
             if peer_node_id:
-                print(f"❌ Peer {peer_node_id} disconnected: {e}")
+                print(f"Peer {peer_node_id} disconnected: {e}")
         finally:
             if peer_node_id:
                 self.peers.pop(peer_node_id, None)
@@ -143,9 +146,9 @@ class P2PNetwork:
                 peer.writer.write(header + raw)
                 ok = await asyncio.wait_for(peer.writer.drain(), timeout=3)
             except Exception as e:
-                print(f"❌ Broadcast failed {peer_id}: {e}")
+                print(f"Broadcast failed {peer_id}: {e}")
                 dead_peers.append(peer_id)
-                
+
         for peer_id in dead_peers:
             self.peers.pop(peer_id, None)
 
@@ -155,7 +158,7 @@ class P2PNetwork:
                 msg = await self.read_message(reader)
                 await self.handle_message(peer_id, msg)
         except Exception as e:
-            print(f"❌ Peer {peer_id} disconnected", e)
+            print(f"Peer {peer_id} disconnected", e)
         finally:
             self.peers.pop(peer_id, None)
             writer.close()
@@ -173,11 +176,12 @@ class P2PNetwork:
     async def read_message(self, reader):
         header = await reader.readexactly(4)
         size = struct.unpack(">I", header)[0]
+        if size > MAX_MSG_SIZE:
+            raise ValueError(f"Message too large: {size} bytes")
         payload = await reader.readexactly(size)
         return json.loads(payload.decode())
-        
+
     async def handle_message(self, peer_id, msg):
-        print(msg)
         if msg["type"] == "status":
             await self.on_status(peer_id, msg)
 
@@ -229,11 +233,11 @@ class P2PNetwork:
             if tx["amount"] <= 0:
                 return
 
-            # transfer → to
+            # transfer requires a recipient
             if tx["action"] not in ("transfer", "mint", "burn", "add_liquidity", "mint_bridge"):
                 return
 
-            # add_liquidity → asset_paired + amount_paired
+            # add_liquidity requires asset_paired and amount_paired
             if tx["action"] == "add_liquidity":
                 if not tx.get("asset_paired"):
                     return
@@ -305,38 +309,38 @@ class P2PNetwork:
         local_block = self.chain[-1]
         prev_block = self.chain[-2] if len(self.chain) > 1 else None
 
-        # Same Index
+        # Same index
         if incoming_block.index != local_block.index:
             return
 
-        chain_until_prev = self.chain[:-1] 
+        chain_until_prev = self.chain[:-1]
 
         if not self.validator.validate(incoming_block, prev_block, chain_until_prev):
-            print("❌ Fork peer invalid → ignoring")
+            print("Peer fork invalid, ignoring")
             return
 
 
-        # Validate my block
+        # Validate local block
         if not self.validator.validate(local_block, prev_block, chain_until_prev):
-            print("My block is invalid → rollback")
+            print("Local block is invalid, rolling back")
             self.chain[-1] = incoming_block
             self.storage.save(self.chain)
             return
 
-        # If both valid → it should NOT happen
-        print("⚠️ Two valid blocks in the same slot → tie-break")
+        # If both valid, this should NOT happen
+        print("Two valid blocks in the same slot, tie-breaking")
 
         if incoming_block.hash < local_block.hash:
-            print("Tie-break: peer win")
+            print("Tie-break: peer wins")
 
-            # remove old recording
+            # Remove old registration
             old_key = (local_block.producer_id, local_block.slot)
             if old_key in self.slot_registry:
                 del self.slot_registry[old_key]
 
-            # record new block
+            # Register new block
             if not self.register_block(incoming_block):
-                print("DOUBLE SIGNING DETECTED!")
+                print("DOUBLE SIGNING DETECTED")
                 return
 
             self.chain[-1] = incoming_block
@@ -344,7 +348,7 @@ class P2PNetwork:
             self.prune_registry()
 
         else:
-            print("I keep my block")
+            print("Keeping local block")
 
 
 
@@ -359,7 +363,7 @@ class P2PNetwork:
         local_hash = self.chain[-1].hash if self.chain else None
 
         print(
-            f"📊 STATUS from {peer_id}: "
+            f"STATUS from {peer_id}: "
             f"peer=({peer_index}, {peer_hash}) "
             f"local=({local_index}, {local_hash})"
         )
@@ -368,11 +372,11 @@ class P2PNetwork:
         if peer_index == local_index and peer_hash == local_hash:
             return
 
-        # Case 1: peer ahead → sync
+        # Case 1: peer ahead, sync
         if peer_index > local_index:
             self.syncing = True
-            self.sync_target = peer_index  
-            print("⬇️ I'm behind, I'm asking for blocks")
+            self.sync_target = peer_index
+            print("Local node is behind, requesting blocks")
             await self.send(self.peers[peer_id].writer, {
                 "type": "get_blocks",
                 "from": local_index + 1
@@ -380,13 +384,13 @@ class P2PNetwork:
             return
 
 
-        # Case 2: peer back → ignore
+        # Case 2: peer behind, ignore
         if peer_index < local_index:
             return
 
-        # Case 3: same index but different hash → fork
+        # Case 3: same index but different hash, fork
         if peer_index == local_index and peer_hash != local_hash:
-            print("⚠️ Fork detected, final block comparison")
+            print("Fork detected, comparing final blocks")
 
             await self.send(self.peers[peer_id].writer, {
                 "type": "get_block",
@@ -399,63 +403,75 @@ class P2PNetwork:
 
         print(f"Sending blocks from index {from_index} to {peer_id}")
 
-        if from_index == 0:
-            blocks = self.chain[:]
-        else:
-            blocks = self.chain[from_index:]
+        blocks = self.chain[from_index:]
 
-        await self.send(self.peers[peer_id].writer, {
-            "type": "blocks",
-            "data": [b.to_dict() for b in blocks]
-        })
+        if not blocks:
+            # Peer is already up to date: send empty last page to finalize sync
+            await self.send(self.peers[peer_id].writer, {
+                "type": "blocks",
+                "data": []
+            })
+            return
+
+        for i in range(0, len(blocks), BLOCKS_PER_PAGE):
+            chunk = blocks[i:i + BLOCKS_PER_PAGE]
+            await self.send(self.peers[peer_id].writer, {
+                "type": "blocks",
+                "data": [b.to_dict() for b in chunk]
+            })
 
     async def on_blocks(self, peer_id, msg):
-        print(f"Received {len(msg['data'])} blocks from {peer_id}")
+        received = msg["data"]
+        print(f"Received {len(received)} blocks from {peer_id}")
 
-        for raw in msg["data"]:
+        for raw in received:
             block = Block.from_dict(raw)
 
-            # 🧱 CASE GENESIS
+            # Genesis case
             if not self.chain:
                 if block.index != 0:
-                    print("❌ Expected genesis, received something else")
+                    print("Expected genesis, received something else")
                     return
 
                 if not self.validator.validate(block, None, []):
-                    print("❌ Invalid genesis")
+                    print("Invalid genesis")
                     return
-                
+
                 # Equivocation check
                 if not self.register_block(block):
-                    print("❌ DOUBLE SIGNING DETECTED")
+                    print("DOUBLE SIGNING DETECTED")
                     return
 
                 self.chain.append(block)
-                print("🧱 Genesis received and added")
+                print("Genesis received and added")
                 continue
 
             chain_until_prev = self.chain[:]
             prev = chain_until_prev[-1]
 
             if not self.validator.validate(block, prev, chain_until_prev):
-                print("❌ Sync failed: invalid block")
+                print("Sync failed: invalid block")
                 return
-            
+
             if block.prev_hash != prev.hash:
-                print("❌ Long fork detected, sync aborted")
+                print("Long fork detected, sync aborted")
                 return
 
             # Equivocation check
             if not self.register_block(block):
-                print("❌ DOUBLE SIGNING DETECTED")
+                print("DOUBLE SIGNING DETECTED")
                 return
 
             self.chain.append(block)
-            
-        self.syncing = False
-        self.sync_target = None 
 
-        # process blocks arrived during sync
+        # Finalize sync only on the last page (partial chunk = no more pages)
+        if len(received) >= BLOCKS_PER_PAGE:
+            return
+
+        self.syncing = False
+        self.sync_target = None
+
+        # Process blocks that arrived during sync
         self.buffered_blocks.sort(key=lambda b: b.index)
         remaining_buffer = []
 
@@ -469,13 +485,13 @@ class P2PNetwork:
                     self.mempool.remove_many(included)
                     print(f"Block #{block.index} added (buffer)")
                 else:
-                    print(f"❌ Block #{block.index} in invalid buffer, discarded")
+                    print(f"Block #{block.index} invalid (from buffer), discarded")
             else:
                 remaining_buffer.append(block)
 
         self.buffered_blocks = remaining_buffer
 
-        print("✅ Sync completed")
+        print("Sync completed")
         self.storage.save(self.chain)
         self.prune_registry()
 
@@ -487,37 +503,37 @@ class P2PNetwork:
         if block.index <= local_tip:
             return
 
-        # Happy Case: Next Block
+        # Happy case: next block
         if block.index == local_tip + 1:
             chain_until_prev = self.chain[:]  # safe snapshot
             prev = chain_until_prev[-1]
 
             if not self.validator.validate(block, prev, chain_until_prev):
-                print("❌ Live block invalid")
+                print("Live block invalid")
                 return
 
             # Equivocation check
             if not self.register_block(block):
-                print("❌ DOUBLE SIGNING DETECTED")
+                print("DOUBLE SIGNING DETECTED")
                 return
 
             self.chain.append(block)
             self.storage.save(self.chain)
             self.prune_registry()
-            
-            # Clean
+
+            # Clean mempool
             included = {tx["txid"] for tx in block.transactions}
             self.mempool.remove_many(included)
             print(f"Block #{block.index} added")
             return
 
-        # Real Gap 
+        # Real gap
         print(
-            f"⚠️ GAP Detected: local={local_tip}, received={block.index}"
+            f"GAP detected: local={local_tip}, received={block.index}"
         )
 
         if self.syncing:
-            print(f"📦 Buffering block #{block.index} (sync in progress)")
+            print(f"Buffering block #{block.index} (sync in progress)")
             self.buffered_blocks.append(block)
             return
 

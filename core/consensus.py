@@ -7,12 +7,13 @@ def select_block_producer(
     validators: List[str],
     last_block_hash: str,
     slot: int,
+    attempt: int = 0,
 ) -> str:
 
     if not validators:
         raise ValueError("Validator set empty")
 
-    seed_material = f"{last_block_hash}|{slot}"
+    seed_material = f"{last_block_hash}|{slot}|{attempt}"
     seed = hashlib.sha256(seed_material.encode()).hexdigest()
 
     best_node = None

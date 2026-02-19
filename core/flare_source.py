@@ -2,24 +2,19 @@ import requests
 from typing import Optional
 from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
+from config.settings import ORACLE_URL
 from core.utils import canonical_json
-
-# 👇 endpoint oracle
-ORACLE_URL = "https://flare-oracle.argh.space/flare/"
-
-# 👇 chiave pubblica oracle (hex)
-ORACLE_PUBKEY = "db8469661f0e6d01664b9759e7dbfb2f289e658e13c04e6418dbb9a27005d524"
-
-
 class FlareSource:
     """
     Blockchain-side flare source.
-    NON calcola nulla.
-    Verifica solo firma oracle.
+    Does not compute anything.
+    Only verifies the oracle signature.
     """
 
-    def __init__(self):
-        self.verify_key = VerifyKey(bytes.fromhex(ORACLE_PUBKEY))
+    def __init__(self, protocol):
+        self.protocol = protocol
+        self.pubkeys = protocol["oracle"]["pubkeys"]
+        self.threshold = protocol["oracle"]["threshold"]
 
     # --------------------------------------------------
     # PUBLIC ENTRYPOINT
@@ -27,9 +22,9 @@ class FlareSource:
 
     def get_flare_for_slot(self, slot: int) -> Optional[dict]:
         """
-        Recupera flare dallo slot specificato.
-        Verifica firma oracle.
-        Deterministico.
+        Fetches flare data for the specified slot.
+        Verifies oracle signature.
+        Deterministic.
         """
 
         try:
@@ -40,15 +35,15 @@ class FlareSource:
 
             data = response.json()
 
-            # verifica slot coerente
+            # verify slot coherence
             if data.get("slot") != slot:
                 return None
 
             if not self._verify_oracle_signature(data):
-                print("❌ Invalid oracle signature")
+                print("Invalid oracle signature")
                 return None
 
-            # ritorna solo dati consensus-critical
+            # return only consensus-critical data
             return {
                 "id": data["id"],
                 "slot": data["slot"],
@@ -67,10 +62,6 @@ class FlareSource:
     # --------------------------------------------------
 
     def _verify_oracle_signature(self, data: dict) -> bool:
-        """
-        Verifica firma ED25519 oracle.
-        """
-
         try:
             signature = bytes.fromhex(data["oracle_signature"])
 
@@ -84,11 +75,17 @@ class FlareSource:
 
             message = canonical_json(payload)
 
-            self.verify_key.verify(message, signature)
+            valid_sigs = 0
 
-            return True
+            for pk in self.pubkeys:
+                try:
+                    verify_key = VerifyKey(bytes.fromhex(pk))
+                    verify_key.verify(message, signature)
+                    valid_sigs += 1
+                except BadSignatureError:
+                    continue
 
-        except BadSignatureError:
-            return False
+            return valid_sigs >= self.threshold
+
         except Exception:
             return False

@@ -16,7 +16,7 @@ class Mempool:
         txs = self.load()
 
         if any(tx["txid"] == tx_dict["txid"] for tx in txs):
-            print("⚠️ TX già presente in mempool:", tx_dict["txid"])
+            print("TX already in mempool:", tx_dict["txid"])
             return False
 
         txs.append(tx_dict)
@@ -28,7 +28,7 @@ class Mempool:
     def load(self):
 
         if not MEMPOOL_FILE.exists():
-            print("❌ MEMPOOL FILE NOT FOUND:", MEMPOOL_FILE)
+            print("MEMPOOL FILE NOT FOUND:", MEMPOOL_FILE)
             return []
 
         raw = MEMPOOL_FILE.read_bytes()
@@ -37,7 +37,7 @@ class Mempool:
             txs = self.crypto.decrypt(raw)
             return txs
         except Exception as e:
-            print("❌ MEMPOOL DECRYPT FAILED:", e)
+            print("MEMPOOL DECRYPT FAILED:", e)
             return []
 
     def flush(self):

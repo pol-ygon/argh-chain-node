@@ -38,7 +38,7 @@ class Transaction:
 
     def hash(self):
         """
-        TXID deterministico, asset-aware
+        Deterministic, asset-aware TXID
         """
         payload = {
             "sender": self.sender,

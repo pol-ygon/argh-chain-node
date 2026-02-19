@@ -21,7 +21,7 @@ class PoolEngine:
         if not pool:
             raise ValueError("Pool not found")
 
-        # 🔁 determines swap direction
+        # Determine swap direction
         if token_in == pool["token0"]:
             x_key, y_key = "reserve0", "reserve1"
         elif token_in == pool["token1"]:

@@ -1,10 +1,10 @@
 # core/state.py
 
 from core.tx_engine import TransactionEngine
-from core.utils import is_system_tx
+from core.utils import get_protocol, is_system_tx
 
 def compute_balances(chain, protocol):
-    """Calcola i balance finali dalla chain"""
+    """Compute final balances from the chain"""
     balances = {}
     tx_engine = TransactionEngine()
     
@@ -14,14 +14,14 @@ def compute_balances(chain, protocol):
         
         for tx in block.get("transactions", []):
 
-            # 🔥 IGNORA transazioni non economiche
+            # Skip non-economic transactions
             if tx.get("action") == "flare_reveal":
                 continue
 
             tx_engine.apply_tx(
                 balances,
                 tx,
-                system=is_system_tx(tx),
+                system=is_system_tx(tx, protocol),
                 validator_address=validator,
                 protocol=protocol
             )
@@ -30,7 +30,7 @@ def compute_balances(chain, protocol):
 
 
 def compute_spendable_balances(chain, pending_txs, protocol):
-    """Calcola balance spendibili (chain + mempool)"""
+    """Compute spendable balances (chain + mempool)"""
     balances = compute_balances(chain, protocol)
     tx_engine = TransactionEngine()
     
@@ -39,7 +39,7 @@ def compute_spendable_balances(chain, pending_txs, protocol):
         tx_engine.apply_tx(
             balances,
             tx,
-            system=is_system_tx(tx),
+            system=is_system_tx(tx, protocol),
             validator_address=None,
             protocol=protocol
         )
@@ -81,6 +81,8 @@ def compute_pools(chain):
 def compute_nonces(chain):
     nonces = {}
 
+    protocol = get_protocol(chain)
+
     for block_data in chain:
         block = block_data if isinstance(block_data, dict) else block_data.to_dict()
 
@@ -89,7 +91,7 @@ def compute_nonces(chain):
             if not sender:
                 continue
 
-            if is_system_tx(tx):
+            if is_system_tx(tx, protocol):
                 continue
 
             nonces[sender] = nonces.get(sender, 0) + 1

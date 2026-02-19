@@ -5,7 +5,7 @@ from core.utils import norm, q
 def generate(chain, p2p, storage):
 
   if not chain and not p2p.peers:
-    print("🧱 Creating GENESIS Block (I'm the first node)")
+    print("Creating GENESIS block (this is the first node)")
 
     genesis_tx = [
         {
@@ -84,7 +84,13 @@ def generate(chain, p2p, storage):
         "allowed_assets": ["ARGH", "aUSD"],
         "native_asset": "ARGH",
         "min_stake": "1000",
-        "slot_duration": 60
+        "slot_duration": 60,
+        "oracle": {
+            "pubkeys": [
+                "db8469661f0e6d01664b9759e7dbfb2f289e658e13c04e6418dbb9a27005d524"
+            ],
+            "threshold": 1
+        }
     }
 
     genesis_block = Block(
@@ -101,4 +107,4 @@ def generate(chain, p2p, storage):
     storage.save(chain)
 
   elif not chain and p2p.peers:
-    print("⏳ Waiting for peers")
+    print("Waiting for peers")

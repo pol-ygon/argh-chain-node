@@ -18,12 +18,14 @@ class Block:
         producer_id: str,
         flare_commit: str | None = None,
         signature: str | None = None,
-        protocol: dict | None = None
+        protocol: dict | None = None,
+        attempt: int = 0
     ):
         self.index = index
         self.prev_hash = prev_hash
         self.producer_id = producer_id
         self.signature = signature
+        self.attempt = attempt
 
         self.slot = slot
         self.block_time = datetime.now(timezone.utc).isoformat()
@@ -47,8 +49,8 @@ class Block:
 
     def compute_hash(self) -> str:
         """
-        SOLO dati consensus-critical.
-        Nessun flare_flux diretto.
+        Only consensus-critical data.
+        No direct flare_flux.
         """
 
         payload = {
@@ -56,6 +58,7 @@ class Block:
             "prev_hash": self.prev_hash,
             "producer_id": self.producer_id,
             "slot": self.slot,
+            "attempt": self.attempt,
             "transactions": self.consensus_txs,
             "flare_commit": self.flare_commit
         }
@@ -70,8 +73,8 @@ class Block:
 
     def get_leader_seed(self) -> str:
         """
-        Leader selection NON dipende dal flare.
-        Usa solo hash del blocco.
+        Leader selection does NOT depend on flare data.
+        Uses only the block hash.
         """
         return self.hash
 
@@ -85,6 +88,7 @@ class Block:
             "producer_id": self.producer_id,
             "signature": self.signature,
             "slot": self.slot,
+            "attempt": self.attempt,
             "block_time": self.block_time,
             "flare_commit": self.flare_commit,
             "transactions": self.transactions,
@@ -106,8 +110,8 @@ class Block:
         obj.producer_id = data.get("producer_id")
         obj.signature = data.get("signature")
         obj.slot = data["slot"]
+        obj.attempt = data.get("attempt", 0)
         obj.block_time = data["block_time"]
-
         obj.transactions = data.get("transactions", [])
         obj.consensus_txs = [
             canonical_tx_consensus(tx) for tx in obj.transactions

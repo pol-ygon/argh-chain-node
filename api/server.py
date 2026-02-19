@@ -1,10 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from config.settings import BRIDGE_ISSUER_ADDRESS, DEVS_ADDRESS, ORBITAL_ADDRESS, TREASURY_ADDRESS
 from core.block import Block
 from core.mempool import Mempool
-from core.state import compute_pools
+from core.state import compute_balances, compute_nonces, compute_pools
 from core.storage import ChainStorage
 from core.tx_engine import TransactionEngine, is_canonical_amount
 from core.utils import canonical_tx, get_protocol
@@ -27,6 +26,8 @@ from datetime import datetime
 
 def iso_to_ts(iso: str) -> int:
     return int(datetime.fromisoformat(iso).timestamp())
+
+CHALLENGE_TTL = 300  # seconds
 
 challenges = {}
 
@@ -65,31 +66,11 @@ def get_latest_block():
 @app.get("/treasury")
 def get_treasury():
     chain = storage.load()
+    protocol = get_protocol(chain)
     
-    # Calculate the Treasury balance
-    balances = {}
-    for block in chain:
-        for tx in block.get("transactions", []):
-            action = tx.get("action")
-            amount = tx.get("amount", 0)
-            sender = tx.get("sender", "").lower()
-            to = tx.get("to", "").lower()
-            
-            if action == "mint":
-                balances[to] = balances.get(to, 0) + amount
-            elif action == "transfer":
-                fee = tx.get("_fee", {})
-                balances[TREASURY_ADDRESS.lower()] = (
-                    balances.get(TREASURY_ADDRESS.lower(), 0)
-                    + fee.get("devs", 0)
-                    + fee.get("orbital", 0)
-                )
-            elif action == "burn":
-                balances[sender] = balances.get(sender, 0) - amount
-            elif action == "add_liquidity":
-                balances[sender] = balances.get(sender, 0) - amount
-    
-    treasury_balance = balances.get(TREASURY_ADDRESS.lower(), 0)
+    balances = compute_balances(chain, protocol)
+    treasury_key = f"{protocol['treasury'].lower()}:{protocol['native_asset']}"
+    treasury_balance = balances.get(treasury_key, 0)
     
     return {
         "treasury": treasury_balance,
@@ -167,8 +148,7 @@ async def send_tx(payload: dict):
         return {"ok": False, "error": "Invalid amount"}
 
     # NONCE CHECK
-    tx_engine = TransactionEngine()
-    expected_nonce = tx_engine._calculate_nonce(sender)
+    expected_nonce = compute_nonces(chain).get(sender, 0)
 
     if tx.get("nonce") != expected_nonce:
         return {"ok": False, "error": f"Invalid nonce. Expected {expected_nonce}"}
@@ -219,15 +199,15 @@ async def send_mint_tx(payload: dict):
 
     sender = recovered.lower()
 
-    # 🔐 Only protocol-defined bridge issuer
+    # Only protocol-defined bridge issuer
     if sender != protocol["bridge_issuer"].lower():
         return {"ok": False, "error": "Unauthorized mint issuer"}
 
-    # 🔐 chainId check
+    # chainId check
     if tx.get("chainId") != protocol["chain_id"]:
         return {"ok": False, "error": "Invalid chainId"}
 
-    # 🔐 asset check
+    # asset check
     native = protocol["native_asset"]
 
     if tx.get("asset") == native:
@@ -236,16 +216,15 @@ async def send_mint_tx(payload: dict):
     if tx.get("asset") not in protocol["allowed_assets"]:
         return {"ok": False, "error": "Unsupported asset"}
 
-    # 🔐 amount check
+    # amount check
     if tx.get("amount", 0) <= 0:
         return {"ok": False, "error": "Invalid amount"}
 
     if not is_canonical_amount(tx["amount"]):
         return {"ok": False, "error": "Non canonical amount"}
 
-    # 🔐 nonce check
-    tx_engine = TransactionEngine()
-    expected_nonce = tx_engine._calculate_nonce(sender)
+    # nonce check
+    expected_nonce = compute_nonces(chain).get(sender, 0)
 
     if tx.get("nonce") != expected_nonce:
         return {"ok": False, "error": f"Invalid nonce. Expected {expected_nonce}"}
@@ -285,6 +264,8 @@ def get_pools():
 @app.get("/market/stats")
 def get_market_stats():
     chain = storage.load()
+
+    protocol = get_protocol(chain)
     
     if not chain:
         return {
@@ -297,48 +278,16 @@ def get_market_stats():
             "pool_liquidity_usd": 0
         }
     
-    # Calculate all balances
-    balances = {}
-    for block in chain:
-        for tx in block.get("transactions", []):
-            action = tx.get("action")
-            amount = tx.get("amount", 0)
-            sender = tx.get("sender", "").lower()
-            to = tx.get("to", "").lower()
-            
-            if action == "mint":
-                balances[to] = balances.get(to, 0) + amount
-            elif action == "transfer":
-                fee = tx.get("_fee", {})
-                fee_total = fee.get("total", 0)
+    balances = compute_balances(chain, protocol)
+    native = protocol["native_asset"]
+    treasury_addr = protocol["treasury"].lower()
 
-                balances[sender] = balances.get(sender, 0) - amount - fee_total
-                balances[to] = balances.get(to, 0) + amount
-
-                # fee split
-                balances[TREASURY_ADDRESS.lower()] = (
-                    balances.get(TREASURY_ADDRESS.lower(), 0)
-                    + fee.get("devs", 0)
-                    + fee.get("orbital", 0)
-                )
-
-                producer = block.get("producer_id", "").lower()
-                balances[producer] = balances.get(producer, 0) + fee.get("validator", 0)
-            elif action == "burn":
-                balances[sender] = balances.get(sender, 0) - amount
-            elif action == "add_liquidity":
-                balances[sender] = balances.get(sender, 0) - amount
-                # Also tracks pool balance
-                pool_address = f"pool:{tx.get('pool_id', '')}".lower()
-                balances[pool_address] = balances.get(pool_address, 0) + amount
-    
-    # ✅ Treasury = balance of TREASURY_ADDRESS
-    treasury = balances.get(TREASURY_ADDRESS.lower(), 0)
-    
-    # Total supply = sum of all balances
-    total_supply = sum(balances.values())
-    
-    # Circulating = total - treasury
+    # Sum all native-asset balances across all addresses (including pools)
+    total_supply = sum(
+        v for key, v in balances.items()
+        if key.endswith(f":{native}") and v > 0
+    )
+    treasury = balances.get(f"{treasury_addr}:{native}", 0)
     circulating_supply = total_supply - treasury
     
     # Find pools
@@ -497,16 +446,24 @@ def tx_all(address: str):
 
 @app.get("/auth/challenge")
 def create_challenge():
+    now = int(time.time())
+
+    # Prune expired or used challenges to prevent unbounded growth
+    expired = [k for k, v in challenges.items() if v["used"] or now - v["created_at"] > CHALLENGE_TTL]
+    for k in expired:
+        del challenges[k]
+
     cid = str(uuid.uuid4())
 
     message = f"""SolarChain Login
     Challenge: {cid}
-    Timestamp: {int(time.time())}
+    Timestamp: {now}
     """
 
     challenges[cid] = {
         "message": message,
-        "used": False
+        "used": False,
+        "created_at": now,
     }
 
     return {
@@ -522,6 +479,10 @@ def verify(payload: dict):
 
     challenge = challenges.get(cid)
     if not challenge or challenge["used"]:
+        return {"ok": False}
+
+    if int(time.time()) - challenge["created_at"] > CHALLENGE_TTL:
+        del challenges[cid]
         return {"ok": False}
 
     msg = encode_defunct(text=challenge["message"])

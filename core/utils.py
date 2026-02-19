@@ -1,8 +1,6 @@
 # core/utils.py
 import json
 
-from config.settings import TREASURY_ADDRESS
-
 def canonical_tx(tx: dict) -> str:
     """
     Returns the canonical representation of the tx
@@ -44,9 +42,9 @@ def canonical_tx_consensus(tx: dict) -> str:
 def norm(addr: str) -> str:
     return addr.lower()
 
-def is_system_tx(tx: dict) -> bool:
+def is_system_tx(tx: dict, protocol) -> bool:
     return (
-        tx.get("sender") == TREASURY_ADDRESS
+        tx.get("sender") == protocol["treasury"]
         and tx.get("action") in ("mint", "burn", "add_liquidity")
     )
 
@@ -85,16 +83,6 @@ def load_validators():
 
     return VALIDATORS, VALIDATOR_PUBKEYS, nodes
 
-def is_equivocation(self, block):
-    for b in self.chain:
-        if (
-            b.slot == block.slot and
-            b.producer_id == block.producer_id and
-            b.hash != block.hash
-        ):
-            return True
-    return False
-
 def canonical_json(obj):
     return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
 
@@ -104,11 +92,11 @@ def get_protocol(chain):
 
     first = chain[0]
 
-    # Caso Block object
+    # Block object
     if hasattr(first, "protocol"):
         return first.protocol
 
-    # Caso dict (API)
+    # Dict (API)
     if isinstance(first, dict):
         return first.get("protocol")
 
